@@ -1,0 +1,1563 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+The content has been processed where security check has been disabled.
+
+================================================================
+File Summary
+================================================================
+
+Purpose:
+--------
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+
+File Format:
+------------
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  a. A separator line (================)
+  b. The file path (File: path/to/file)
+  c. Another separator line
+  d. The full contents of the file
+  e. A blank line
+
+Usage Guidelines:
+-----------------
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+
+Notes:
+------
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: samples/python/agents/langgraph/**/*, samples/python/agents/a2a_telemetry/**/*
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Security check has been disabled - content may contain sensitive information
+- Files are sorted by Git change count (files with more changes are at the bottom)
+
+
+================================================================
+Directory Structure
+================================================================
+samples/
+  python/
+    agents/
+      a2a_telemetry/
+        __main__.py
+        agent_executor.py
+        docker-compose.yaml
+        pyproject.toml
+        README.md
+      langgraph/
+        app/
+          __main__.py
+          agent_executor.py
+          agent.py
+          test_client.py
+        Containerfile
+        pyproject.toml
+        README.md
+
+================================================================
+Files
+================================================================
+
+================
+File: samples/python/agents/a2a_telemetry/__main__.py
+================
+import logging
+import os
+
+import click
+import uvicorn
+
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import InMemoryTaskStore
+from a2a.types import AgentCapabilities, AgentCard, AgentSkill
+from agent_executor import QnAAgentExecutor
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+    OTLPSpanExporter,
+)
+from opentelemetry.instrumentation.starlette import StarletteInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+
+logger = logging.getLogger(__name__)
+logging.basicConfig()
+
+
+@click.command()
+@click.option('--host', 'host', default='localhost')
+@click.option('--port', 'port', default=10020)
+def main(host: str, port: int):
+    """A2A Telemetry Sample GRPC Server."""
+    if not os.getenv('GOOGLE_API_KEY'):
+        raise ValueError('GOOGLE_API_KEY is not set.')
+
+    skill = AgentSkill(
+        id='question_answer',
+        name='Q&A Agent',
+        description='A helpful assistant agent that can answer questions.',
+        tags=['Question-Answer'],
+        examples=[
+            'Who is leading 2025 F1 Standings?',
+            'Where can i find an active volcano?',
+        ],
+    )
+
+    agent_executor = QnAAgentExecutor()
+    agent_card = AgentCard(
+        name='Q&A Agent',
+        description='A helpful assistant agent that can answer questions.',
+        url=f'http://{host}:{port}/',
+        version='1.0.0',
+        defaultInputModes=['text'],
+        defaultOutputModes=['text'],
+        capabilities=AgentCapabilities(streaming=True),
+        skills=[skill],
+    )
+    request_handler = DefaultRequestHandler(
+        agent_executor=agent_executor, task_store=InMemoryTaskStore()
+    )
+
+    logger.debug('Telemetry Configuration')
+    # Set the service name for query back in Jaeger and Grafana
+    resource = Resource(
+        attributes={
+            'service.name': 'a2a-telemetry-sample',
+            'service.version': '1.0',
+        }
+    )
+    # Create a TracerProvider and register it
+    tracer_provider = TracerProvider(resource=resource)
+    trace.set_tracer_provider(tracer_provider)
+    tracer_provider = trace.get_tracer_provider()
+
+    # Create and configure Jaeger exporter, UDP transport.
+    jaeger_exporter = OTLPSpanExporter(
+        endpoint='http://localhost:4317', insecure=True
+    )
+    tracer_provider.add_span_processor(BatchSpanProcessor(jaeger_exporter))
+
+    server = A2AStarletteApplication(agent_card, request_handler)
+    starlette_app = server.build()
+    # Instrument the starlette app for tracing
+    StarletteInstrumentor().instrument_app(starlette_app)
+    uvicorn.run(starlette_app, host=host, port=port)
+
+
+if __name__ == '__main__':
+    main()
+
+================
+File: samples/python/agents/a2a_telemetry/agent_executor.py
+================
+import logging
+
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.server.tasks import TaskUpdater
+from a2a.types import TaskState, TextPart, UnsupportedOperationError
+from a2a.utils import new_agent_text_message
+from a2a.utils.errors import ServerError
+from google.adk import Runner
+from google.adk.agents import LlmAgent
+from google.adk.artifacts import InMemoryArtifactService
+from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
+from google.adk.sessions import InMemorySessionService
+from google.adk.tools import google_search_tool
+from google.genai import types
+
+
+logger = logging.getLogger(__name__)
+
+
+class QnAAgentExecutor(AgentExecutor):
+    """Agent executor that uses the ADK to answer questions."""
+
+    def __init__(self):
+        self.agent = None
+        self.runner = None
+
+    def _init_agent(self):
+        self.agent = LlmAgent(
+            model='gemini-2.0-flash-exp',
+            name='question_answer_agent',
+            description='A helpful assistant agent that can answer questions.',
+            instruction="""Respond to the query using google search""",
+            tools=[google_search_tool.google_search],
+        )
+        self.runner = self.runner = Runner(
+            app_name=self.agent.name,
+            agent=self.agent,
+            artifact_service=InMemoryArtifactService(),
+            session_service=InMemorySessionService(),
+            memory_service=InMemoryMemoryService(),
+        )
+
+    async def cancel(self, context: RequestContext, event_queue: EventQueue):
+        raise ServerError(error=UnsupportedOperationError())
+
+    async def execute(
+        self,
+        context: RequestContext,
+        event_queue: EventQueue,
+    ) -> None:
+        if self.agent is None:
+            self._init_agent()
+        logger.debug(f'Executing agent {self.agent.name}')
+
+        query = context.get_user_input()
+
+        updater = TaskUpdater(event_queue, context.task_id, context.context_id)
+
+        if not context.current_task:
+            await updater.submit()
+
+        await updater.start_work()
+
+        content = types.Content(role='user', parts=[types.Part(text=query)])
+        session = await self.runner.session_service.get_session(
+            app_name=self.runner.app_name,
+            user_id='123',
+            session_id=context.context_id,
+        ) or await self.runner.session_service.create_session(
+            app_name=self.runner.app_name,
+            user_id='123',
+            session_id=context.context_id,
+        )
+
+        async for event in self.runner.run_async(
+            session_id=session.id, user_id='123', new_message=content
+        ):
+            logger.debug(f'Event from ADK {event}')
+            if event.is_final_response():
+                parts = event.content.parts
+                text_parts = [
+                    TextPart(text=part.text) for part in parts if part.text
+                ]
+                await updater.add_artifact(
+                    text_parts,
+                    name='result',
+                )
+                await updater.complete()
+                break
+            await updater.update_status(
+                TaskState.working, message=new_agent_text_message('Working...')
+            )
+        else:
+            logger.debug('Agent failed to complete')
+            await updater.update_status(
+                TaskState.failed,
+                message=new_agent_text_message(
+                    'Failed to generate a response.'
+                ),
+            )
+
+================
+File: samples/python/agents/a2a_telemetry/docker-compose.yaml
+================
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"     # Jaeger Frontend
+      - "14268:14268"     # Jaeger HTTP Collector
+      - "6831:6831/udp"   # Jaeger UDP Collector
+      - "4317:4317"       # Jaeger OLTP, grpc.
+      - "4318:4318"       # Jaeger OLTP, http.
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true # OLTP Enabled
+    networks:
+      - a2a_tracing
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000" # Grafana Ports
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin # Admin Password
+    volumes:
+      - grafana-storage:/var/lib/grafana
+    depends_on:
+      - jaeger
+    networks:
+      - a2a_tracing
+
+volumes:
+  grafana-storage:
+
+networks:
+  a2a_tracing:
+    driver: bridge
+
+================
+File: samples/python/agents/a2a_telemetry/pyproject.toml
+================
+[project]
+name = "a2a-telemetry"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "a2a-sdk>=0.2.9",
+    "google-adk>=1.0.0",
+    "opentelemetry-api>=1.33.1",
+    "opentelemetry-exporter-jaeger>=1.11.1",
+    "opentelemetry-exporter-otlp>=1.33.1",
+    "opentelemetry-instrumentation-requests>=0.54b1",
+    "opentelemetry-instrumentation-starlette>=0.54b1",
+    "opentelemetry-sdk>=1.33.1",
+]
+
+================
+File: samples/python/agents/a2a_telemetry/README.md
+================
+# Tracing with A2A SDK
+
+This sample project demonstrates the distributed tracing feature in A2A SDK, with traces exported to Jaeger. It features an agent built with  Google's Agent Development Kit (ADK), utilizing the Google Search tool to respond to user queries.
+
+The primary goal is to showcase how to enable and export traces from an A2A server and client, and how these traces can be collected and visualized using Jaeger and Grafana.
+
+## Core Functionality
+
+*   **Agent:** A simple conversational agent that uses Google Search to answer questions.
+*   **Tracing:** Enabled based on the configuration in  `__main__.py`.
+*   **Trace Export:** Traces are sent to a Jaeger backend running in Docker.
+*   **Visualization:** Traces can be viewed and analyzed in the Jaeger UI and Grafana.
+
+## Files
+
+*   `__main__.py`: The main entry point for the application. It sets up the OpenTelemetry tracer, Jaeger exporter, and starts the A2A Server.
+*   `agent_executor.py`: Contains the logic for the agent, including the integration of the Google Search tool and custom span creation for tracing specific operations.
+*   `docker-compose.yaml`: A Docker Compose file to easily set up and run Jaeger and Grafana services.
+
+## Prerequisites
+
+*   Python 3.8+
+*   Docker and Docker Compose
+*   Google API Key:
+
+
+## Setup
+
+
+1.  **Set Environment Variables:**
+
+    ```bash
+    export GOOGLE_API_KEY="YOUR_GOOGLE_API_KEY"
+    ```
+    Replace `"YOUR_GOOGLE_API_KEY"` with your api key
+
+3.  **Start Jaeger and Grafana:**
+
+    ```bash
+    docker compose up -d
+    ```
+    This will start:
+    *   **Jaeger:** UI accessible at `http://localhost:16686`.
+    *   **Grafana:** UI accessible at `http://localhost:3000` (default login: `admin`/`admin`).
+
+    **Important Note on OTLP Port:** The Python application (`__main__.py`) is configured to send traces to Jaeger via OTLP grpc . The provided `docker-compose.yaml` for Jaeger enables the OTLP collector. Ensure that port `4317` is mapped from the host to the Jaeger container. If you wish to change ports in docker-compose.yaml, __main__.py has to be updates.
+
+
+## Running the Application
+
+1.  Once the environment variables are set and the Docker containers are running, execute the main script:
+    ```bash
+    uv run .
+    ```
+
+2.  The application will start on port 10020
+    Run the CLI or the UI tool to interact with the agent. The traces are collected and sent to Jaeger.
+
+3.  To stop the application, you can typically use `Ctrl+C`.
+
+## Viewing Traces
+
+### 1. Jaeger UI
+
+*   Open your web browser and navigate to the Jaeger UI: `http://localhost:16686`.
+*   In the "Service" dropdown menu on the left sidebar under search, select `a2a-telemetry-sample` (this is the service name configured in `__main__.py`).
+*   Click the "Find Traces" button. You should see a list of traces, with each trace corresponding to an interaction with the agent.
+*   Click on any trace to view its detailed span hierarchy, logs, and tags. You will see spans for the overall agent invocation, calls to the Google Search tool, and LLM (if applicable) processing.
+
+### 2. Grafana UI
+
+Grafana can be configured to use Jaeger as a data source, allowing you to visualize traces and create dashboards.
+
+*   **Access Grafana:** Open `http://localhost:3000` in your browser. Log in using the default credentials: username `admin`, password `admin`. You may be prompted to change the password on your first login.
+
+*   **Add Jaeger as a Data Source:**
+    1.  Navigate to "Connections" (or click the gear icon for "Configuration" then "Data Sources" in older Grafana versions).
+    2.  Click on "Add new connection" or "Add data source".
+    3.  Search for "Jaeger" in the list of available data sources and select it.
+    4.  Configure the Jaeger data source settings:
+        *   **Name:** You can leave it as `Jaeger` or choose a custom name.
+        *   **URL:** `http://jaeger:16686`
+            *(This URL uses the Jaeger service name `jaeger` as defined in `docker-compose.yaml`, allowing Grafana to connect to Jaeger within the Docker network).*
+        *   Leave other settings as default unless you have specific requirements.
+    5.  Click "Save & Test". You should see a confirmation message like "Data source is working".
+
+*   **Explore Traces in Grafana:**
+    1.  On the left sidebar, navigate to "Explore".
+    2.  From the dropdown menu at the top-left of the Explore view, select the Jaeger data source you just configured.
+    3.  You can now query for traces:
+        *   Use the "Service" dropdown to select `a2a-telemetry-sample`.
+        *   Search by Trace ID if you have one, or use other filters.
+    4.  You can also create dashboards (Dashboard -> New Dashboard -> Add visualization) and use the Jaeger data source to build panels for trace data.
+
+## Stopping the Services
+
+To stop and remove the Jaeger and Grafana containers defined in `docker-compose.yaml`, run:
+```bash
+docker compose down
+```
+
+## Disclaimer
+Important: The sample code provided is for demonstration purposes and illustrates the mechanics of the Agent-to-Agent (A2A) protocol. When building production applications, it is critical to treat any agent operating outside of your direct control as a potentially untrusted entity.
+
+All data received from an external agent—including but not limited to its AgentCard, messages, artifacts, and task statuses—should be handled as untrusted input. For example, a malicious agent could provide an AgentCard containing crafted data in its fields (e.g., description, name, skills.description). If this data is used without sanitization to construct prompts for a Large Language Model (LLM), it could expose your application to prompt injection attacks.  Failure to properly validate and sanitize this data before use can introduce security vulnerabilities into your application.
+
+Developers are responsible for implementing appropriate security measures, such as input validation and secure handling of credentials to protect their systems and users.
+
+================
+File: samples/python/agents/langgraph/app/__main__.py
+================
+import logging
+import os
+import sys
+
+import click
+import httpx
+import uvicorn
+
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import InMemoryPushNotifier, InMemoryTaskStore
+from a2a.types import (
+    AgentCapabilities,
+    AgentCard,
+    AgentSkill,
+)
+from dotenv import load_dotenv
+
+from app.agent import CurrencyAgent
+from app.agent_executor import CurrencyAgentExecutor
+
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class MissingAPIKeyError(Exception):
+    """Exception for missing API key."""
+
+
+@click.command()
+@click.option('--host', 'host', default='localhost')
+@click.option('--port', 'port', default=10000)
+def main(host, port):
+    """Starts the Currency Agent server."""
+    try:
+        if os.getenv('model_source', 'google') == 'google':
+            if not os.getenv('GOOGLE_API_KEY'):
+                raise MissingAPIKeyError(
+                    'GOOGLE_API_KEY environment variable not set.'
+                )
+        else:
+            if not os.getenv('TOOL_LLM_URL'):
+                raise MissingAPIKeyError(
+                    'TOOL_LLM_URL environment variable not set.'
+                )
+            if not os.getenv('TOOL_LLM_NAME'):
+                raise MissingAPIKeyError(
+                    'TOOL_LLM_NAME environment not variable not set.'
+                )
+
+        capabilities = AgentCapabilities(streaming=True, pushNotifications=True)
+        skill = AgentSkill(
+            id='convert_currency',
+            name='Currency Exchange Rates Tool',
+            description='Helps with exchange values between various currencies',
+            tags=['currency conversion', 'currency exchange'],
+            examples=['What is exchange rate between USD and GBP?'],
+        )
+        agent_card = AgentCard(
+            name='Currency Agent',
+            description='Helps with exchange rates for currencies',
+            url=f'http://{host}:{port}/',
+            version='1.0.0',
+            defaultInputModes=CurrencyAgent.SUPPORTED_CONTENT_TYPES,
+            defaultOutputModes=CurrencyAgent.SUPPORTED_CONTENT_TYPES,
+            capabilities=capabilities,
+            skills=[skill],
+        )
+
+        # --8<-- [start:DefaultRequestHandler]
+        httpx_client = httpx.AsyncClient()
+        request_handler = DefaultRequestHandler(
+            agent_executor=CurrencyAgentExecutor(),
+            task_store=InMemoryTaskStore(),
+            push_notifier=InMemoryPushNotifier(httpx_client),
+        )
+        server = A2AStarletteApplication(
+            agent_card=agent_card, http_handler=request_handler
+        )
+
+        uvicorn.run(server.build(), host=host, port=port)
+        # --8<-- [end:DefaultRequestHandler]
+
+    except MissingAPIKeyError as e:
+        logger.error(f'Error: {e}')
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f'An error occurred during server startup: {e}')
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
+
+================
+File: samples/python/agents/langgraph/app/agent_executor.py
+================
+import logging
+
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.server.tasks import TaskUpdater
+from a2a.types import (
+    InternalError,
+    InvalidParamsError,
+    Part,
+    Task,
+    TaskState,
+    TextPart,
+    UnsupportedOperationError,
+)
+from a2a.utils import (
+    new_agent_text_message,
+    new_task,
+)
+from a2a.utils.errors import ServerError
+
+from app.agent import CurrencyAgent
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class CurrencyAgentExecutor(AgentExecutor):
+    """Currency Conversion AgentExecutor Example."""
+
+    def __init__(self):
+        self.agent = CurrencyAgent()
+
+    async def execute(
+        self,
+        context: RequestContext,
+        event_queue: EventQueue,
+    ) -> None:
+        error = self._validate_request(context)
+        if error:
+            raise ServerError(error=InvalidParamsError())
+
+        query = context.get_user_input()
+        task = context.current_task
+        if not task:
+            task = new_task(context.message) # type: ignore
+            await event_queue.enqueue_event(task)
+        updater = TaskUpdater(event_queue, task.id, task.contextId)
+        try:
+            async for item in self.agent.stream(query, task.contextId):
+                is_task_complete = item['is_task_complete']
+                require_user_input = item['require_user_input']
+
+                if not is_task_complete and not require_user_input:
+                    await updater.update_status(
+                        TaskState.working,
+                        new_agent_text_message(
+                            item['content'],
+                            task.contextId,
+                            task.id,
+                        ),
+                    )
+                elif require_user_input:
+                    await updater.update_status(
+                        TaskState.input_required,
+                        new_agent_text_message(
+                            item['content'],
+                            task.contextId,
+                            task.id,
+                        ),
+                        final=True,
+                    )
+                    break
+                else:
+                    await updater.add_artifact(
+                        [Part(root=TextPart(text=item['content']))],
+                        name='conversion_result',
+                    )
+                    await updater.complete()
+                    break
+
+        except Exception as e:
+            logger.error(f'An error occurred while streaming the response: {e}')
+            raise ServerError(error=InternalError()) from e
+
+    def _validate_request(self, context: RequestContext) -> bool:
+        return False
+
+    async def cancel(
+        self, context: RequestContext, event_queue: EventQueue
+    ) -> None:
+        raise ServerError(error=UnsupportedOperationError())
+
+================
+File: samples/python/agents/langgraph/app/agent.py
+================
+import os
+
+from collections.abc import AsyncIterable
+from typing import Any, Literal
+
+import httpx
+
+from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.tools import tool
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import create_react_agent
+from pydantic import BaseModel
+
+
+memory = MemorySaver()
+
+
+@tool
+def get_exchange_rate(
+    currency_from: str = 'USD',
+    currency_to: str = 'EUR',
+    currency_date: str = 'latest',
+):
+    """Use this to get current exchange rate.
+
+    Args:
+        currency_from: The currency to convert from (e.g., "USD").
+        currency_to: The currency to convert to (e.g., "EUR").
+        currency_date: The date for the exchange rate or "latest". Defaults to
+            "latest".
+
+    Returns:
+        A dictionary containing the exchange rate data, or an error message if
+        the request fails.
+    """
+    try:
+        response = httpx.get(
+            f'https://api.frankfurter.app/{currency_date}',
+            params={'from': currency_from, 'to': currency_to},
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        if 'rates' not in data:
+            return {'error': 'Invalid API response format.'}
+        return data
+    except httpx.HTTPError as e:
+        return {'error': f'API request failed: {e}'}
+    except ValueError:
+        return {'error': 'Invalid JSON response from API.'}
+
+
+class ResponseFormat(BaseModel):
+    """Respond to the user in this format."""
+
+    status: Literal['input_required', 'completed', 'error'] = 'input_required'
+    message: str
+
+
+class CurrencyAgent:
+    """CurrencyAgent - a specialized assistant for currency convesions."""
+
+    SYSTEM_INSTRUCTION = (
+        'You are a specialized assistant for currency conversions. '
+        "Your sole purpose is to use the 'get_exchange_rate' tool to answer questions about currency exchange rates. "
+        'If the user asks about anything other than currency conversion or exchange rates, '
+        'politely state that you cannot help with that topic and can only assist with currency-related queries. '
+        'Do not attempt to answer unrelated questions or use tools for other purposes.'
+    )
+
+    FORMAT_INSTRUCTION = (
+        'Set response status to input_required if the user needs to provide more information to complete the request.'
+        'Set response status to error if there is an error while processing the request.'
+        'Set response status to completed if the request is complete.'
+    )
+
+    def __init__(self):
+        model_source = os.getenv('model_source', 'google')
+        if model_source == 'google':
+            self.model = ChatGoogleGenerativeAI(model='gemini-2.0-flash')
+        else:
+            self.model = ChatOpenAI(
+                model=os.getenv('TOOL_LLM_NAME'),
+                openai_api_key=os.getenv('API_KEY', 'EMPTY'),
+                openai_api_base=os.getenv('TOOL_LLM_URL'),
+                temperature=0,
+            )
+        self.tools = [get_exchange_rate]
+
+        self.graph = create_react_agent(
+            self.model,
+            tools=self.tools,
+            checkpointer=memory,
+            prompt=self.SYSTEM_INSTRUCTION,
+            response_format=(self.FORMAT_INSTRUCTION, ResponseFormat),
+        )
+
+    async def stream(self, query, context_id) -> AsyncIterable[dict[str, Any]]:
+        inputs = {'messages': [('user', query)]}
+        config = {'configurable': {'thread_id': context_id}}
+
+        for item in self.graph.stream(inputs, config, stream_mode='values'):
+            message = item['messages'][-1]
+            if (
+                isinstance(message, AIMessage)
+                and message.tool_calls
+                and len(message.tool_calls) > 0
+            ):
+                yield {
+                    'is_task_complete': False,
+                    'require_user_input': False,
+                    'content': 'Looking up the exchange rates...',
+                }
+            elif isinstance(message, ToolMessage):
+                yield {
+                    'is_task_complete': False,
+                    'require_user_input': False,
+                    'content': 'Processing the exchange rates..',
+                }
+
+        yield self.get_agent_response(config)
+
+    def get_agent_response(self, config):
+        current_state = self.graph.get_state(config)
+        structured_response = current_state.values.get('structured_response')
+        if structured_response and isinstance(
+            structured_response, ResponseFormat
+        ):
+            if structured_response.status == 'input_required':
+                return {
+                    'is_task_complete': False,
+                    'require_user_input': True,
+                    'content': structured_response.message,
+                }
+            if structured_response.status == 'error':
+                return {
+                    'is_task_complete': False,
+                    'require_user_input': True,
+                    'content': structured_response.message,
+                }
+            if structured_response.status == 'completed':
+                return {
+                    'is_task_complete': True,
+                    'require_user_input': False,
+                    'content': structured_response.message,
+                }
+
+        return {
+            'is_task_complete': False,
+            'require_user_input': True,
+            'content': (
+                'We are unable to process your request at the moment. '
+                'Please try again.'
+            ),
+        }
+
+    SUPPORTED_CONTENT_TYPES = ['text', 'text/plain']
+
+================
+File: samples/python/agents/langgraph/app/test_client.py
+================
+import logging
+
+from typing import Any
+from uuid import uuid4
+
+import httpx
+
+from a2a.client import A2ACardResolver, A2AClient
+from a2a.types import (
+    AgentCard,
+    MessageSendParams,
+    SendMessageRequest,
+    SendStreamingMessageRequest,
+)
+
+
+PUBLIC_AGENT_CARD_PATH = '/.well-known/agent.json'
+EXTENDED_AGENT_CARD_PATH = '/agent/authenticatedExtendedCard'
+
+
+async def main() -> None:
+    # Configure logging to show INFO level messages
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)  # Get a logger instance
+
+    # --8<-- [start:A2ACardResolver]
+
+    base_url = 'http://localhost:10000'
+
+    async with httpx.AsyncClient() as httpx_client:
+        # Initialize A2ACardResolver
+        resolver = A2ACardResolver(
+            httpx_client=httpx_client,
+            base_url=base_url,
+            # agent_card_path uses default, extended_agent_card_path also uses default
+        )
+        # --8<-- [end:A2ACardResolver]
+
+        # Fetch Public Agent Card and Initialize Client
+        final_agent_card_to_use: AgentCard | None = None
+
+        try:
+            logger.info(
+                f'Attempting to fetch public agent card from: {base_url}{PUBLIC_AGENT_CARD_PATH}'
+            )
+            _public_card = (
+                await resolver.get_agent_card()
+            )  # Fetches from default public path
+            logger.info('Successfully fetched public agent card:')
+            logger.info(
+                _public_card.model_dump_json(indent=2, exclude_none=True)
+            )
+            final_agent_card_to_use = _public_card
+            logger.info(
+                '\nUsing PUBLIC agent card for client initialization (default).'
+            )
+
+            if _public_card.supportsAuthenticatedExtendedCard:
+                try:
+                    logger.info(
+                        '\nPublic card supports authenticated extended card. '
+                        'Attempting to fetch from: '
+                        f'{base_url}{EXTENDED_AGENT_CARD_PATH}'
+                    )
+                    auth_headers_dict = {
+                        'Authorization': 'Bearer dummy-token-for-extended-card'
+                    }
+                    _extended_card = await resolver.get_agent_card(
+                        relative_card_path=EXTENDED_AGENT_CARD_PATH,
+                        http_kwargs={'headers': auth_headers_dict},
+                    )
+                    logger.info(
+                        'Successfully fetched authenticated extended agent card:'
+                    )
+                    logger.info(
+                        _extended_card.model_dump_json(
+                            indent=2, exclude_none=True
+                        )
+                    )
+                    final_agent_card_to_use = (
+                        _extended_card  # Update to use the extended card
+                    )
+                    logger.info(
+                        '\nUsing AUTHENTICATED EXTENDED agent card for client '
+                        'initialization.'
+                    )
+                except Exception as e_extended:
+                    logger.warning(
+                        f'Failed to fetch extended agent card: {e_extended}. '
+                        'Will proceed with public card.',
+                        exc_info=True,
+                    )
+            elif (
+                _public_card
+            ):  # supportsAuthenticatedExtendedCard is False or None
+                logger.info(
+                    '\nPublic card does not indicate support for an extended card. Using public card.'
+                )
+
+        except Exception as e:
+            logger.error(
+                f'Critical error fetching public agent card: {e}', exc_info=True
+            )
+            raise RuntimeError(
+                'Failed to fetch the public agent card. Cannot continue.'
+            ) from e
+
+        # --8<-- [start:send_message]
+        client = A2AClient(
+            httpx_client=httpx_client, agent_card=final_agent_card_to_use
+        )
+        logger.info('A2AClient initialized.')
+
+        send_message_payload: dict[str, Any] = {
+            'message': {
+                'role': 'user',
+                'parts': [
+                    {'kind': 'text', 'text': 'how much is 10 USD in INR?'}
+                ],
+                'messageId': uuid4().hex,
+            },
+        }
+        request = SendMessageRequest(
+            id=str(uuid4()), params=MessageSendParams(**send_message_payload)
+        )
+
+        response = await client.send_message(request)
+        print(response.model_dump(mode='json', exclude_none=True))
+        # --8<-- [end:send_message]
+
+        # --8<-- [start:Multiturn]
+        send_message_payload_multiturn: dict[str, Any] = {
+            'message': {
+                'role': 'user',
+                'parts': [
+                    {
+                        'kind': 'text',
+                        'text': 'How much is the exchange rate for 1 USD?',
+                    }
+                ],
+                'messageId': uuid4().hex,
+            },
+        }
+        request = SendMessageRequest(
+            id=str(uuid4()),
+            params=MessageSendParams(**send_message_payload_multiturn),
+        )
+
+        response = await client.send_message(request)
+        print(response.model_dump(mode='json', exclude_none=True))
+
+        task_id = response.root.result.id
+        contextId = response.root.result.contextId
+
+        second_send_message_payload_multiturn: dict[str, Any] = {
+            'message': {
+                'role': 'user',
+                'parts': [{'kind': 'text', 'text': 'CAD'}],
+                'messageId': uuid4().hex,
+                'taskId': task_id,
+                'contextId': contextId,
+            },
+        }
+
+        second_request = SendMessageRequest(
+            id=str(uuid4()),
+            params=MessageSendParams(**second_send_message_payload_multiturn),
+        )
+        second_response = await client.send_message(second_request)
+        print(second_response.model_dump(mode='json', exclude_none=True))
+        # --8<-- [end:Multiturn]
+
+        # --8<-- [start:send_message_streaming]
+
+        streaming_request = SendStreamingMessageRequest(
+            id=str(uuid4()), params=MessageSendParams(**send_message_payload)
+        )
+
+        stream_response = client.send_message_streaming(streaming_request)
+
+        async for chunk in stream_response:
+            print(chunk.model_dump(mode='json', exclude_none=True))
+        # --8<-- [end:send_message_streaming]
+
+
+if __name__ == '__main__':
+    import asyncio
+
+    asyncio.run(main())
+
+================
+File: samples/python/agents/langgraph/Containerfile
+================
+FROM registry.access.redhat.com/ubi8/python-312
+
+# Set work directory
+WORKDIR /opt/app-root
+
+# Copy Python Project Files (Container context must be the `python` directory)
+COPY . /opt/app-root
+
+USER root
+
+# Install system build dependencies and UV package manager
+RUN dnf -y update && dnf install -y gcc gcc-c++ \
+ && pip install uv
+
+# Set environment variables for uv:
+# UV_COMPILE_BYTECODE=1: Compiles Python files to .pyc for faster startup
+# UV_LINK_MODE=copy: Ensures files are copied, not symlinked, which can avoid issues
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
+# Install dependencies using uv sync.
+# --frozen: Ensures uv respects the uv.lock file
+# --no-install-project: Prevents installing the project itself in this stage
+# --no-dev: Excludes development dependencies
+# --mount=type=cache: Leverages Docker's build cache for uv, speeding up repeated builds
+RUN --mount=type=cache,target=/.cache/uv \
+    uv sync --frozen --no-install-project --no-dev
+
+# Install the project
+RUN --mount=type=cache,target=/.cache/uv \
+    uv sync --frozen --no-dev
+
+# Allow non-root user to access the everything in app-root
+RUN chgrp -R root /opt/app-root/ && chmod -R g+rwx /opt/app-root/
+
+# Expose default port (change if needed)
+EXPOSE 10000
+
+USER 1001
+
+# Run the agent
+CMD uv run app --host 0.0.0.0
+
+================
+File: samples/python/agents/langgraph/pyproject.toml
+================
+[project]
+name = "a2a-sample-agent-langgraph"
+version = "0.1.0"
+description = "Sample LangGraph currency agent with A2A Protocol"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "a2a-sdk==0.2.8",
+    "click>=8.1.8",
+    "httpx>=0.28.1",
+    "langchain-google-genai>=2.0.10",
+    "langgraph>=0.3.18",
+    "langchain-openai >=0.1.0",
+    "pydantic>=2.10.6",
+    "python-dotenv>=1.1.0",
+    "uvicorn>=0.34.2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+================
+File: samples/python/agents/langgraph/README.md
+================
+# LangGraph Currency Agent with A2A Protocol
+
+This sample demonstrates a currency conversion agent built with [LangGraph](https://langchain-ai.github.io/langgraph/) and exposed through the A2A protocol. It showcases conversational interactions with support for multi-turn dialogue and streaming responses.
+
+## How It Works
+
+This agent uses LangGraph with LLM (for example Google Gemini..) to provide currency exchange information through a ReAct agent pattern. The A2A protocol enables standardized interaction with the agent, allowing clients to send requests and receive real-time updates.
+
+```mermaid
+sequenceDiagram
+    participant Client as A2A Client
+    participant Server as A2A Server
+    participant Agent as LangGraph Agent
+    participant API as Frankfurter API
+
+    Client->>Server: Send task with currency query
+    Server->>Agent: Forward query to currency agent
+
+    alt Complete Information
+        Agent->>API: Call get_exchange_rate tool
+        API->>Agent: Return exchange rate data
+        Agent->>Server: Process data & return result
+        Server->>Client: Respond with currency information
+    else Incomplete Information
+        Agent->>Server: Request additional input
+        Server->>Client: Set state to "input-required"
+        Client->>Server: Send additional information
+        Server->>Agent: Forward additional info
+        Agent->>API: Call get_exchange_rate tool
+        API->>Agent: Return exchange rate data
+        Agent->>Server: Process data & return result
+        Server->>Client: Respond with currency information
+    end
+
+    alt With Streaming
+        Note over Client,Server: Real-time status updates
+        Server->>Client: "Looking up exchange rates..."
+        Server->>Client: "Processing exchange rates..."
+        Server->>Client: Final result
+    end
+```
+
+## Key Features
+
+- **Multi-turn Conversations**: Agent can request additional information when needed
+- **Real-time Streaming**: Provides status updates during processing
+- **Push Notifications**: Support for webhook-based notifications
+- **Conversational Memory**: Maintains context across interactions
+- **Currency Exchange Tool**: Integrates with Frankfurter API for real-time rates
+
+## Prerequisites
+
+- Python 3.12 or higher
+- [UV](https://docs.astral.sh/uv/)
+- Access to an LLM and API Key
+
+## Setup & Running
+
+1. Navigate to the samples directory:
+
+   ```bash
+   cd samples/python/agents/langgraph
+   ```
+
+2. Create an environment file with your API key:
+
+   ```bash
+   If you're using a Google Gemini model (gemini-pro, etc.):
+   echo "GOOGLE_API_KEY=your_api_key_here" > .env
+  
+   
+   If you're using OpenAI or any compatible API (e.g., local LLM via Ollama, LM Studio, etc.):
+
+   echo "API_KEY=your_api_key_here" > .env  (not neccessary if have no api key)
+   echo "TOOL_LLM_URL=your_llm_url" > .env
+   echo "TOOL_LLM_NAME=your_llm_name" > .env
+
+   ```
+
+3. Run the agent:
+
+   ```bash
+   # Basic run on default port 10000
+   uv run app
+
+   # On custom host/port
+   uv run app --host 0.0.0.0 --port 8080
+   ```
+
+4. In a separate terminal, run the test client:
+
+   ```bash
+   uv run app/test_client.py
+   ```
+
+## Build Container Image
+
+Agent can also be built using a container file.
+
+1. Navigate to the `samples/python/agents/langgraph` directory:
+
+  ```bash
+  cd samples/python/agents/langgraph
+  ```
+
+2. Build the container file
+
+    ```bash
+    podman build . -t langgraph-a2a-server
+    ```
+
+> [!Tip]  
+> Podman is a drop-in replacement for `docker` which can also be used in these commands.
+
+3. Run your container
+
+    ```bash
+    podman run -p 10000:10000 -e GOOGLE_API_KEY=your_api_key_here langgraph-a2a-server
+    ```
+
+4. Run A2A client (follow step 5 from the section above)
+
+> [!Important]
+> * **Access URL:** You must access the A2A client through the URL `0.0.0.0:10000`. Using `localhost` will not work.
+> * **Hostname Override:** If you're deploying to an environment where the hostname is defined differently outside the container, use the `HOST_OVERRIDE` environment variable to set the expected hostname on the Agent Card. This ensures proper communication with your client application.
+
+## Technical Implementation
+
+- **LangGraph ReAct Agent**: Uses the ReAct pattern for reasoning and tool usage
+- **Streaming Support**: Provides incremental updates during processing
+- **Checkpoint Memory**: Maintains conversation state between turns
+- **Push Notification System**: Webhook-based updates with JWK authentication
+- **A2A Protocol Integration**: Full compliance with A2A specifications
+
+## Limitations
+
+- Only supports text-based input/output (no multi-modal support)
+- Uses Frankfurter API which has limited currency options
+- Memory is session-based and not persisted between server restarts
+
+## Examples
+
+**Synchronous request**
+
+Request:
+
+```
+POST http://localhost:10000
+Content-Type: application/json
+
+{
+    "id": "12113c25-b752-473f-977e-c9ad33cf4f56",
+    "jsonrpc": "2.0",
+    "method": "message/send",
+    "params": {
+        "message": {
+            "kind": "message",
+            "messageId": "120ec73f93024993becf954d03a672bc",
+            "parts": [
+                {
+                    "kind": "text",
+                    "text": "how much is 10 USD in INR?"
+                }
+            ],
+            "role": "user"
+        }
+    }
+}
+```
+
+Response:
+
+```
+{
+    "id": "12113c25-b752-473f-977e-c9ad33cf4f56",
+    "jsonrpc": "2.0",
+    "result": {
+        "artifacts": [
+            {
+                "artifactId": "08373241-a745-4abe-a78b-9ca60882bcc6",
+                "name": "conversion_result",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "10 USD is 856.2 INR."
+                    }
+                ]
+            }
+        ],
+        "contextId": "e329f200-eaf4-4ae9-a8ef-a33cf9485367",
+        "history": [
+            {
+                "contextId": "e329f200-eaf4-4ae9-a8ef-a33cf9485367",
+                "kind": "message",
+                "messageId": "120ec73f93024993becf954d03a672bc",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "how much is 10 USD in INR?"
+                    }
+                ],
+                "role": "user",
+                "taskId": "58124b63-dd3b-46b8-bf1d-1cc1aefd1c8f"
+            },
+            {
+                "contextId": "e329f200-eaf4-4ae9-a8ef-a33cf9485367",
+                "kind": "message",
+                "messageId": "d8b4d7de-709f-40f7-ae0c-fd6ee398a2bf",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "Looking up the exchange rates..."
+                    }
+                ],
+                "role": "agent",
+                "taskId": "58124b63-dd3b-46b8-bf1d-1cc1aefd1c8f"
+            },
+            {
+                "contextId": "e329f200-eaf4-4ae9-a8ef-a33cf9485367",
+                "kind": "message",
+                "messageId": "ee0cb3b6-c3d6-4316-8d58-315c437a2a77",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "Processing the exchange rates.."
+                    }
+                ],
+                "role": "agent",
+                "taskId": "58124b63-dd3b-46b8-bf1d-1cc1aefd1c8f"
+            }
+        ],
+        "id": "58124b63-dd3b-46b8-bf1d-1cc1aefd1c8f",
+        "kind": "task",
+        "status": {
+            "state": "completed"
+        }
+    }
+}
+```
+
+**Multi-turn example**
+
+Request - Seq 1:
+
+```
+POST http://localhost:10000
+Content-Type: application/json
+
+{
+    "id": "27be771b-708f-43b8-8366-968966d07ec0",
+    "jsonrpc": "2.0",
+    "method": "message/send",
+    "params": {
+        "message": {
+            "kind": "message",
+            "messageId": "296eafc9233142bd98279e4055165f12",
+            "parts": [
+                {
+                    "kind": "text",
+                    "text": "How much is the exchange rate for 1 USD?"
+                }
+            ],
+            "role": "user"
+        }
+    }
+}
+```
+
+Response - Seq 2:
+
+```
+{
+    "id": "27be771b-708f-43b8-8366-968966d07ec0",
+    "jsonrpc": "2.0",
+    "result": {
+        "contextId": "a7cc0bef-17b5-41fc-9379-40b99f46a101",
+        "history": [
+            {
+                "contextId": "a7cc0bef-17b5-41fc-9379-40b99f46a101",
+                "kind": "message",
+                "messageId": "296eafc9233142bd98279e4055165f12",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "How much is the exchange rate for 1 USD?"
+                    }
+                ],
+                "role": "user",
+                "taskId": "9d94c2d4-06e4-40e1-876b-22f5a2666e61"
+            }
+        ],
+        "id": "9d94c2d4-06e4-40e1-876b-22f5a2666e61",
+        "kind": "task",
+        "status": {
+            "message": {
+                "contextId": "a7cc0bef-17b5-41fc-9379-40b99f46a101",
+                "kind": "message",
+                "messageId": "f0f5f3ff-335c-4e77-9b4a-01ff3908e7be",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "Please specify which currency you would like to convert to."
+                    }
+                ],
+                "role": "agent",
+                "taskId": "9d94c2d4-06e4-40e1-876b-22f5a2666e61"
+            },
+            "state": "input-required"
+        }
+    }
+}
+```
+
+Request - Seq 3:
+
+```
+POST http://localhost:10000
+Content-Type: application/json
+
+{
+    "id": "b88d818d-1192-42be-b4eb-3ee6b96a7e35",
+    "jsonrpc": "2.0",
+    "method": "message/send",
+    "params": {
+        "message": {
+            "contextId": "a7cc0bef-17b5-41fc-9379-40b99f46a101",
+            "kind": "message",
+            "messageId": "70371e1f231f4597b65ccdf534930ca9",
+            "parts": [
+                {
+                    "kind": "text",
+                    "text": "CAD"
+                }
+            ],
+            "role": "user",
+            "taskId": "9d94c2d4-06e4-40e1-876b-22f5a2666e61"
+        }
+    }
+}
+```
+
+Response - Seq 4:
+
+```
+{
+    "id": "b88d818d-1192-42be-b4eb-3ee6b96a7e35",
+    "jsonrpc": "2.0",
+    "result": {
+        "artifacts": [
+            {
+                "artifactId": "08373241-a745-4abe-a78b-9ca60882bcc6",
+                "name": "conversion_result",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "The exchange rate for 1 USD to CAD is 1.3739."
+                    }
+                ]
+            }
+        ],
+        "contextId": "a7cc0bef-17b5-41fc-9379-40b99f46a101",
+        "history": [
+            {
+                "contextId": "a7cc0bef-17b5-41fc-9379-40b99f46a101",
+                "kind": "message",
+                "messageId": "296eafc9233142bd98279e4055165f12",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "How much is the exchange rate for 1 USD?"
+                    }
+                ],
+                "role": "user",
+                "taskId": "9d94c2d4-06e4-40e1-876b-22f5a2666e61"
+            },
+            {
+                "contextId": "a7cc0bef-17b5-41fc-9379-40b99f46a101",
+                "kind": "message",
+                "messageId": "f0f5f3ff-335c-4e77-9b4a-01ff3908e7be",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "Please specify which currency you would like to convert to."
+                    }
+                ],
+                "role": "agent",
+                "taskId": "9d94c2d4-06e4-40e1-876b-22f5a2666e61"
+            },
+            {
+                "contextId": "a7cc0bef-17b5-41fc-9379-40b99f46a101",
+                "kind": "message",
+                "messageId": "70371e1f231f4597b65ccdf534930ca9",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "CAD"
+                    }
+                ],
+                "role": "user",
+                "taskId": "9d94c2d4-06e4-40e1-876b-22f5a2666e61"
+            },
+            {
+                "contextId": "a7cc0bef-17b5-41fc-9379-40b99f46a101",
+                "kind": "message",
+                "messageId": "0eb4f200-a8cd-4d34-94f8-4d223eb1b2c0",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "Looking up the exchange rates..."
+                    }
+                ],
+                "role": "agent",
+                "taskId": "9d94c2d4-06e4-40e1-876b-22f5a2666e61"
+            },
+            {
+                "contextId": "a7cc0bef-17b5-41fc-9379-40b99f46a101",
+                "kind": "message",
+                "messageId": "41c7c03a-a772-4dc8-a868-e8c7b7defc91",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "Processing the exchange rates.."
+                    }
+                ],
+                "role": "agent",
+                "taskId": "9d94c2d4-06e4-40e1-876b-22f5a2666e61"
+            }
+        ],
+        "id": "9d94c2d4-06e4-40e1-876b-22f5a2666e61",
+        "kind": "task",
+        "status": {
+            "state": "completed"
+        }
+    }
+}
+```
+
+**Streaming example**
+
+Request:
+
+```
+{
+    "id": "6d12d159-ec67-46e6-8d43-18480ce7f6ca",
+    "jsonrpc": "2.0",
+    "method": "message/stream",
+    "params": {
+        "message": {
+            "kind": "message",
+            "messageId": "2f9538ef0984471aa0d5179ce3c67a28",
+            "parts": [
+                {
+                    "kind": "text",
+                    "text": "how much is 10 USD in INR?"
+                }
+            ],
+            "role": "user"
+        }
+    }
+}
+```
+
+Response:
+
+```
+data: {"id":"6d12d159-ec67-46e6-8d43-18480ce7f6ca","jsonrpc":"2.0","result":{"contextId":"cd09e369-340a-4563-bca4-e5f2e0b9ff81","history":[{"contextId":"cd09e369-340a-4563-bca4-e5f2e0b9ff81","kind":"message","messageId":"2f9538ef0984471aa0d5179ce3c67a28","parts":[{"kind":"text","text":"how much is 10 USD in INR?"}],"role":"user","taskId":"423a2569-f272-4d75-a4d1-cdc6682188e5"}],"id":"423a2569-f272-4d75-a4d1-cdc6682188e5","kind":"task","status":{"state":"submitted"}}}
+
+data: {"id":"6d12d159-ec67-46e6-8d43-18480ce7f6ca","jsonrpc":"2.0","result":{"contextId":"cd09e369-340a-4563-bca4-e5f2e0b9ff81","final":false,"kind":"status-update","status":{"message":{"contextId":"cd09e369-340a-4563-bca4-e5f2e0b9ff81","kind":"message","messageId":"1854a825-c64f-4f30-96f2-c8aa558b83f9","parts":[{"kind":"text","text":"Looking up the exchange rates..."}],"role":"agent","taskId":"423a2569-f272-4d75-a4d1-cdc6682188e5"},"state":"working"},"taskId":"423a2569-f272-4d75-a4d1-cdc6682188e5"}}
+
+data: {"id":"6d12d159-ec67-46e6-8d43-18480ce7f6ca","jsonrpc":"2.0","result":{"contextId":"cd09e369-340a-4563-bca4-e5f2e0b9ff81","final":false,"kind":"status-update","status":{"message":{"contextId":"cd09e369-340a-4563-bca4-e5f2e0b9ff81","kind":"message","messageId":"e72127a6-4830-4320-bf23-235ac79b9a13","parts":[{"kind":"text","text":"Processing the exchange rates.."}],"role":"agent","taskId":"423a2569-f272-4d75-a4d1-cdc6682188e5"},"state":"working"},"taskId":"423a2569-f272-4d75-a4d1-cdc6682188e5"}}
+
+data: {"id":"6d12d159-ec67-46e6-8d43-18480ce7f6ca","jsonrpc":"2.0","result":{"artifact":{"artifactId":"08373241-a745-4abe-a78b-9ca60882bcc6","name":"conversion_result","parts":[{"kind":"text","text":"10 USD is 856.2 INR."}]},"contextId":"cd09e369-340a-4563-bca4-e5f2e0b9ff81","kind":"artifact-update","taskId":"423a2569-f272-4d75-a4d1-cdc6682188e5"}}
+
+data: {"id":"6d12d159-ec67-46e6-8d43-18480ce7f6ca","jsonrpc":"2.0","result":{"contextId":"cd09e369-340a-4563-bca4-e5f2e0b9ff81","final":true,"kind":"status-update","status":{"state":"completed"},"taskId":"423a2569-f272-4d75-a4d1-cdc6682188e5"}}
+```
+
+## Learn More
+
+- [A2A Protocol Documentation](https://a2aproject.github.io/A2A/)
+- [LangGraph Documentation](https://langchain-ai.github.io/langgraph/)
+- [Frankfurter API](https://www.frankfurter.app/docs/)
+- [Google Gemini API](https://ai.google.dev/gemini-api)
+
+
+## Disclaimer
+Important: The sample code provided is for demonstration purposes and illustrates the mechanics of the Agent-to-Agent (A2A) protocol. When building production applications, it is critical to treat any agent operating outside of your direct control as a potentially untrusted entity.
+
+All data received from an external agent—including but not limited to its AgentCard, messages, artifacts, and task statuses—should be handled as untrusted input. For example, a malicious agent could provide an AgentCard containing crafted data in its fields (e.g., description, name, skills.description). If this data is used without sanitization to construct prompts for a Large Language Model (LLM), it could expose your application to prompt injection attacks.  Failure to properly validate and sanitize this data before use can introduce security vulnerabilities into your application.
+
+Developers are responsible for implementing appropriate security measures, such as input validation and secure handling of credentials to protect their systems and users.
+
+
+
+
+================================================================
+End of Codebase
+================================================================

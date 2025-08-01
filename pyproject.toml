@@ -12,7 +12,9 @@ dependencies = [
     "a2a-sdk>=0.3.0",
     "fastmcp>=2.10.6",
     "google-adk>=1.9.0",
+    "langchain-google-genai>=2.1.8",
     "langchain-mcp-adapters>=0.1.9",
+    "langchain-openai>=0.3.28",
     "langgraph>=0.6.2",
 ]
 

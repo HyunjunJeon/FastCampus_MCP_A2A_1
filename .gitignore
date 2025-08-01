@@ -1,9 +1,10 @@
 _DS_Store
 dist/
 shrimp_data/
-.python-version
 
 # AI Folder
 .cursor/
 riper_docs/
 memory-bank/
+CLAUDE.md
+.claude/

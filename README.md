@@ -1,7 +1,6 @@
 # MCP 와 A2A 로 개발하는 Multi Agent
 
-FastCampus 온라인강의 `MCP 와 A2A 로 개발하는 Multi Agent` 강의
-실습 자료
+FastCampus 온라인강의 [MCP 와 A2A 로 개발하는 Multi Agent](https://fastcampus.co.kr/data_online_mcpa2a) 실습 자료 1번
 
 ## 개발 환경 셋팅
 
